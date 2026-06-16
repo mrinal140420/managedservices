@@ -66,9 +66,8 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
 # ---------------------------------------------------------
 def send_custom_email(to_email: str, subject: str, body: str, cc_emails: List[str] = None):
     """Sends custom, branded HTML emails directly from FastAPI."""
-    sender_email = "mrinalsahoo25@gmail.com"
-    sender_password = "aijjlcbcpsttvpln" # Insert your Google App Password here
-
+    sender_email = os.getenv("SENDER_EMAIL")
+    sender_password = os.getenv("SENDER_PASSWORD")
     msg = EmailMessage()
     msg.set_content(body)
     msg['Subject'] = subject
