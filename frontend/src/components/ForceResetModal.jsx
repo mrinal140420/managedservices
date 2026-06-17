@@ -10,7 +10,7 @@ const ForceResetModal = () => {
 
   if (!forceReset) return null;
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     if (newPassword !== confirmPassword) {
       setError('Passwords do not match');
@@ -22,7 +22,11 @@ const ForceResetModal = () => {
     }
     
     // Process reset
-    completePasswordReset();
+    setError('');
+    const result = await completePasswordReset(newPassword);
+    if (!result.success) {
+      setError(result.error);
+    }
   };
 
   return (

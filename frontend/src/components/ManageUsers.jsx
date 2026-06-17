@@ -73,6 +73,35 @@ const ManageUsers = () => {
     }
   };
 
+  const handleEditEmail = async (userId, currentEmail) => {
+    const newEmail = window.prompt("Enter the new email address for this user:", currentEmail);
+    if (!newEmail || newEmail === currentEmail) return;
+    
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+      setActionStatus({ userId, type: 'error', message: 'Invalid email format' });
+      return;
+    }
+
+    setActionStatus({ userId, type: 'loading', message: 'Updating email...' });
+    try {
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/users/${userId}/email`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: newEmail })
+      });
+      if (response.ok) {
+        setActionStatus({ userId, type: 'success', message: 'Email updated successfully' });
+        fetchUsers();
+        setTimeout(() => setActionStatus({ userId: null, type: null, message: null }), 3000);
+      } else {
+        const errData = await response.json();
+        setActionStatus({ userId, type: 'error', message: errData.detail || 'Email update failed' });
+      }
+    } catch (err) {
+      setActionStatus({ userId, type: 'error', message: 'Network error' });
+    }
+  };
+
   if (isLoading) return <div className="text-sm text-text-muted">Loading users...</div>;
 
   return (
@@ -120,6 +149,12 @@ const ManageUsers = () => {
                             className="px-2.5 py-1.5 text-xs font-medium border border-border bg-canvas rounded hover:bg-surface-hover transition-colors text-text-secondary"
                           >
                             Reset Password
+                          </button>
+                          <button
+                            onClick={() => handleEditEmail(u.id, u.email)}
+                            className="px-2.5 py-1.5 text-xs font-medium border border-border bg-canvas rounded hover:bg-surface-hover transition-colors text-text-secondary"
+                          >
+                            Edit Email
                           </button>
                           <button
                             onClick={() => handleAction(u.id, 'delete')}

@@ -68,13 +68,37 @@ def send_custom_email(to_email: str, subject: str, body: str, cc_emails: List[st
     """Sends custom, branded HTML emails directly from FastAPI."""
     sender_email = os.getenv("SENDER_EMAIL")
     sender_password = os.getenv("SENDER_PASSWORD")
+    
     msg = EmailMessage()
-    msg.set_content(body)
     msg['Subject'] = subject
     msg['From'] = sender_email
     msg['To'] = to_email
     if cc_emails:
         msg['Cc'] = ', '.join(cc_emails)
+        
+    html_template = f"""
+    <html>
+      <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f5; padding: 30px; color: #18181b;">
+        <div style="background-color: #ffffff; padding: 30px; border: 1px solid #e4e4e7; border-radius: 12px; max-width: 600px; margin: 0 auto; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);">
+          <div style="text-align: center; margin-bottom: 24px;">
+            <div style="background-color: #4f46e5; color: #ffffff; padding: 12px 24px; border-radius: 8px; display: inline-block; font-weight: 700; font-size: 18px; letter-spacing: 0.5px;">
+              Mentis DevOps
+            </div>
+          </div>
+          <div style="font-size: 15px; line-height: 1.6; color: #3f3f46;">
+            {body.replace(chr(10), '<br>')}
+          </div>
+          <div style="margin-top: 32px; padding-top: 20px; border-top: 1px solid #e4e4e7; font-size: 12px; color: #a1a1aa; text-align: center;">
+            Mentis Command Center &bull; Automated Security Notification<br>
+            Please do not reply to this email directly.
+          </div>
+        </div>
+      </body>
+    </html>
+    """
+    
+    msg.set_content("Please enable HTML viewing to see this email.")
+    msg.add_alternative(html_template, subtype='html')
 
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587)
@@ -658,6 +682,88 @@ def reset_user_password(user_id: int):
         """
         send_custom_email(user['email'], "DevOps Command Center - Password Reset", email_body)
         
-        return {"status": "success", "message": "Password reset successfully and email sent."}
+        return {"status": "success", "message": f"Password reset email sent to {user['email']}"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class PasswordUpdate(BaseModel):
+    password: str
+
+@app.put("/api/users/{user_id}/password")
+def update_user_password(user_id: int, data: PasswordUpdate):
+    """Updates the user's password with an MD5 hash so MantisBT treats it as a permanent password."""
+    import pymysql
+    import hashlib
+    try:
+        connection = pymysql.connect(
+            host=os.getenv('DB_HOST', 'localhost'),
+            user=os.getenv('DB_USER', 'root'),
+            password=os.getenv('DB_PASS', 'root'),
+            database=os.getenv('DB_NAME', 'managedservices')
+        )
+        md5_hash = hashlib.md5(data.password.encode()).hexdigest()
+        with connection.cursor() as cursor:
+            cursor.execute("UPDATE mantis_user_table SET password=%s WHERE id=%s", (md5_hash, user_id))
+        connection.commit()
+        connection.close()
+        return {"status": "success", "message": "Password updated successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+class EmailUpdate(BaseModel):
+    email: str
+
+@app.put("/api/users/{user_id}/email")
+def update_user_email(user_id: int, data: EmailUpdate):
+    """Updates the user's email, preventing conflicts and notifying admin."""
+    import pymysql
+    try:
+        connection = pymysql.connect(
+            host=os.getenv('DB_HOST', 'localhost'),
+            user=os.getenv('DB_USER', 'root'),
+            password=os.getenv('DB_PASS', 'root'),
+            database=os.getenv('DB_NAME', 'managedservices'),
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        
+        with connection.cursor() as cursor:
+            # 1. Check for conflicts
+            cursor.execute("SELECT id FROM mantis_user_table WHERE email=%s AND id!=%s", (data.email, user_id))
+            conflict = cursor.fetchone()
+            if conflict:
+                connection.close()
+                raise HTTPException(status_code=409, detail="This email is already associated with another account.")
+            
+            # 2. Get old email and username for notification
+            cursor.execute("SELECT username, email FROM mantis_user_table WHERE id=%s", (user_id,))
+            user = cursor.fetchone()
+            if not user:
+                connection.close()
+                raise HTTPException(status_code=404, detail="User not found.")
+            old_email = user['email']
+            username = user['username']
+            
+            # 3. Update Email
+            cursor.execute("UPDATE mantis_user_table SET email=%s WHERE id=%s", (data.email, user_id))
+        
+        connection.commit()
+        connection.close()
+        
+        # 4. Notify Administrator
+        admin_email = os.getenv("ADMIN_EMAIL", "admin@adamastech.in")
+        if old_email != data.email:
+            notify_body = f"""
+            <h3>Email Address Modified</h3>
+            <p>The email address for user <strong>{username}</strong> has been changed.</p>
+            <ul>
+                <li><strong>Old Email:</strong> {old_email}</li>
+                <li><strong>New Email:</strong> {data.email}</li>
+            </ul>
+            """
+            send_custom_email(admin_email, "Security Alert: User Email Changed", notify_body)
+            
+        return {"status": "success", "message": "Email updated successfully."}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

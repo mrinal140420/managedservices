@@ -47,12 +47,29 @@ export const AuthProvider = ({ children }) => {
     setForceReset(false);
   };
 
-  const completePasswordReset = () => {
-    // Ideally, make an API call to update the password in MantisBT here
-    const updatedUser = { ...user, is_temp_password: false };
-    localStorage.setItem('user_data', JSON.stringify(updatedUser));
-    setUser(updatedUser);
-    setForceReset(false);
+  const completePasswordReset = async (newPassword) => {
+    try {
+      const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/users/${user.id}/password`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ password: newPassword })
+      });
+      if (response.ok) {
+        const updatedUser = { ...user, is_temp_password: false };
+        localStorage.setItem('user_data', JSON.stringify(updatedUser));
+        setUser(updatedUser);
+        setForceReset(false);
+        return { success: true };
+      } else {
+        const errData = await response.json();
+        return { success: false, error: errData.detail || 'Failed to update password' };
+      }
+    } catch (err) {
+      return { success: false, error: 'Network error. Please try again.' };
+    }
   };
 
   return (
