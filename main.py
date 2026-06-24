@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Depends, status, Form, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, status, Form, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import requests
@@ -44,7 +44,7 @@ HEADERS = {
 # ---------------------------------------------------------
 SECRET_KEY = "your-super-secret-jwt-key" # In production, use env variable
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 1440 # 24 hours
+ACCESS_TOKEN_EXPIRE_MINUTES = 480 # 8 hours
 
 def hash_password(password: str):
     """Ensure secure password hashing before any database storage."""
@@ -60,6 +60,35 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
+
+def get_current_user(authorization: str = Header(None)):
+    """JWT validation dependency for protected routes."""
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Not authenticated. Please log in.")
+    
+    # Support both "Bearer <token>" and raw token
+    token = authorization
+    if authorization.startswith("Bearer "):
+        token = authorization[7:]
+    
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username = payload.get("sub")
+        if username is None:
+            raise HTTPException(status_code=401, detail="Invalid token payload.")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token. Please log in again.")
+
+# ---------------------------------------------------------
+# VERIFY TOKEN ENDPOINT
+# ---------------------------------------------------------
+@app.get("/api/verify-token")
+def verify_token(current_user: dict = Depends(get_current_user)):
+    """Lightweight endpoint to check if the stored JWT is still valid."""
+    return {"valid": True, "username": current_user.get("sub"), "access_level": current_user.get("access_level")}
 
 # ---------------------------------------------------------
 # EMAIL ENGINE: Python SMTP Sender
@@ -135,7 +164,7 @@ def login(request: LoginRequest):
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices'),
+            database=os.getenv('DB_NAME', 'mantisdb'),
             cursorclass=pymysql.cursors.DictCursor
         )
         
@@ -394,58 +423,105 @@ class UserCreate(BaseModel):
 
 @app.post("/api/users")
 def create_user(user: UserCreate):
-    """Creates a user, hashes their password, and sends a welcome email."""
+    """Creates a user, hashes their password, and sends a welcome email.
+    Tries the MantisBT REST API first; falls back to direct SQL if it returns 404."""
+    import pymysql
+    import hashlib
+    
     # 1. Generate a secure 12-character temporary password
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
     temp_password = ''.join(secrets.choice(alphabet) for i in range(12))
 
     # 2. Hash the password for secure local storage/verification
     secure_hash = hash_password(temp_password)
-    # (Optional: Save `user.username` and `secure_hash` to your own local React-auth DB here)
 
-    # 3. Send to MantisBT API
+    # 3. Try MantisBT REST API first
     mantis_payload = {
         "username": user.username,
-        "password": temp_password, # MantisBT requires plain text to do its own internal hashing
+        "password": temp_password,
         "real_name": user.real_name,
         "email": user.email,
         "access_level": {"id": user.access_level}
     }
     
-    response = requests.post(f"{MANTIS_API_URL}users/", headers=HEADERS, json=mantis_payload)
+    user_created = False
+    try:
+        response = requests.post(f"{MANTIS_API_URL}users/", headers=HEADERS, json=mantis_payload)
+        if response.status_code in [200, 201]:
+            user_created = True
+        elif response.status_code == 404:
+            # MantisBT REST API doesn't support user creation — fall back to SQL
+            print(f"MantisBT REST API returned 404 for user creation. Falling back to direct SQL.")
+        else:
+            # Other API error — check if it's a duplicate or real failure
+            error_detail = response.text
+            raise HTTPException(status_code=response.status_code, detail=f"MantisBT error: {error_detail}")
+    except requests.exceptions.ConnectionError:
+        print("MantisBT REST API unreachable. Falling back to direct SQL.")
     
-    if response.status_code in [200, 201]:
-        # Force the password in the database to be our bcrypt hash so our /api/login logic works
-        import pymysql
+    # 4. Fallback: create user directly in MySQL if the API didn't work
+    if not user_created:
         try:
             connection = pymysql.connect(
                 host=os.getenv('DB_HOST', 'localhost'),
-            user=os.getenv('DB_USER', 'root'),
-            password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices')
+                user=os.getenv('DB_USER', 'root'),
+                password=os.getenv('DB_PASS', 'root'),
+                database=os.getenv('DB_NAME', 'mantisdb')
+            )
+            with connection.cursor() as cursor:
+                # Check if user already exists
+                cursor.execute("SELECT id FROM mantis_user_table WHERE username=%s OR email=%s", 
+                              (user.username, user.email))
+                existing = cursor.fetchone()
+                if existing:
+                    connection.close()
+                    raise HTTPException(status_code=409, detail="A user with this username or email already exists.")
+                
+                # Insert the new user with bcrypt hash
+                import time
+                now = int(time.time())
+                cursor.execute("""
+                    INSERT INTO mantis_user_table 
+                    (username, email, password, realname, access_level, enabled, date_created, last_visit, cookie_string)
+                    VALUES (%s, %s, %s, %s, %s, 1, %s, %s, %s)
+                """, (user.username, user.email, secure_hash, user.real_name, 
+                      user.access_level, now, now, secrets.token_hex(32)))
+            connection.commit()
+            connection.close()
+            user_created = True
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to create user via SQL fallback: {str(e)}")
+    else:
+        # API succeeded — force the password to our bcrypt hash so our /api/login logic works
+        try:
+            connection = pymysql.connect(
+                host=os.getenv('DB_HOST', 'localhost'),
+                user=os.getenv('DB_USER', 'root'),
+                password=os.getenv('DB_PASS', 'root'),
+                database=os.getenv('DB_NAME', 'mantisdb')
             )
             with connection.cursor() as cursor:
                 cursor.execute("UPDATE mantis_user_table SET password=%s WHERE username=%s", (secure_hash, user.username))
             connection.commit()
             connection.close()
         except Exception as e:
-            print("Failed to force update password:", e)
-            
-        # 4. Trigger the custom onboarding email
-        email_body = f"""
-        Welcome to the DevOps Command Center!
-        
-        Your account has been successfully provisioned.
-        Username: {user.username}
-        Temporary Password: {temp_password}
-        
-        Please log in at http://localhost:5173/login and update your password immediately.
-        """
-        send_custom_email(user.email, "Welcome to DevOps Command Center - Your Credentials", email_body)
-        
-        return {"message": "User created and welcome email sent."}
-    else:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
+            print(f"Warning: Failed to force update password hash: {e}")
+    
+    # 5. Trigger the custom onboarding email
+    email_body = f"""
+    Welcome to the DevOps Command Center!
+    
+    Your account has been successfully provisioned.
+    Username: {user.username}
+    Temporary Password: {temp_password}
+    
+    Please log in at http://localhost:5173/login and update your password immediately.
+    """
+    send_custom_email(user.email, "Welcome to DevOps Command Center - Your Credentials", email_body)
+    
+    return {"message": "User created and welcome email sent."}
 
 # ---------------------------------------------------------
 # NEW ROUTE: Project Assignment & Notification
@@ -496,7 +572,7 @@ def get_admin_dropdown_data():
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices'),
+            database=os.getenv('DB_NAME', 'mantisdb'),
             cursorclass=pymysql.cursors.DictCursor
         )
         
@@ -541,7 +617,7 @@ def get_user_assigned_projects(user_id: int):
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices'),
+            database=os.getenv('DB_NAME', 'mantisdb'),
             cursorclass=pymysql.cursors.DictCursor
         )
         with connection.cursor() as cursor:
@@ -568,7 +644,7 @@ def get_user_custom_categories(user_id: int):
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices'),
+            database=os.getenv('DB_NAME', 'mantisdb'),
             cursorclass=pymysql.cursors.DictCursor
         )
         with connection.cursor() as cursor:
@@ -595,7 +671,7 @@ def create_project_category(project_id: int, category: CategoryCreate):
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices')
+            database=os.getenv('DB_NAME', 'mantisdb')
         )
         with connection.cursor() as cursor:
             cursor.execute('''
@@ -629,7 +705,7 @@ def toggle_user_status(user_id: int, enabled: bool):
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices')
+            database=os.getenv('DB_NAME', 'mantisdb')
         )
         with connection.cursor() as cursor:
             cursor.execute("UPDATE mantis_user_table SET enabled=%s WHERE id=%s", (1 if enabled else 0, user_id))
@@ -648,7 +724,7 @@ def reset_user_password(user_id: int):
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices'),
+            database=os.getenv('DB_NAME', 'mantisdb'),
             cursorclass=pymysql.cursors.DictCursor
         )
         
@@ -691,24 +767,44 @@ class PasswordUpdate(BaseModel):
 
 @app.put("/api/users/{user_id}/password")
 def update_user_password(user_id: int, data: PasswordUpdate):
-    """Updates the user's password with an MD5 hash so MantisBT treats it as a permanent password."""
+    """Updates the user's password with an MD5 hash so MantisBT treats it as a permanent password.
+    MD5 hash signals to login() that this is no longer a temporary password."""
     import pymysql
     import hashlib
+    
+    if not data.password or len(data.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+    
     try:
         connection = pymysql.connect(
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices')
+            database=os.getenv('DB_NAME', 'mantisdb')
         )
         md5_hash = hashlib.md5(data.password.encode()).hexdigest()
         with connection.cursor() as cursor:
+            # Verify the user exists before updating
+            cursor.execute("SELECT id FROM mantis_user_table WHERE id=%s", (user_id,))
+            if not cursor.fetchone():
+                connection.close()
+                raise HTTPException(status_code=404, detail=f"User with id {user_id} not found.")
+            
             cursor.execute("UPDATE mantis_user_table SET password=%s WHERE id=%s", (md5_hash, user_id))
+            rows_affected = cursor.rowcount
         connection.commit()
         connection.close()
+        
+        if rows_affected == 0:
+            raise HTTPException(status_code=500, detail="Password update failed — no rows affected.")
+        
+        print(f"Password updated successfully for user_id={user_id} (MD5 hash stored)")
         return {"status": "success", "message": "Password updated successfully."}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"CRITICAL: Password update failed for user_id={user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Password update failed: {str(e)}")
 
 class EmailUpdate(BaseModel):
     email: str
@@ -722,7 +818,7 @@ def update_user_email(user_id: int, data: EmailUpdate):
             host=os.getenv('DB_HOST', 'localhost'),
             user=os.getenv('DB_USER', 'root'),
             password=os.getenv('DB_PASS', 'root'),
-            database=os.getenv('DB_NAME', 'managedservices'),
+            database=os.getenv('DB_NAME', 'mantisdb'),
             cursorclass=pymysql.cursors.DictCursor
         )
         
